@@ -1,0 +1,15 @@
+This project includes code derived from xray_re-tools.
+
+Original project:
+http://xray.codeplex.com/
+Author: bardak (setback)
+
+Mirror used:
+https://github.com/abramcumner/xray_re-tools
+
+The original project does not provide a standard open-source
+license. Use is based on the permission statement from the
+upstream project: "you can do whatever you want, just do not
+say you wrote it."
+
+All third-party components remain under their respective licenses.
