@@ -1,0 +1,39 @@
+name: Build XDB plugin
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  workflow_call:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [ x64, Win32 ]
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout repository (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Configure (CMake ${{ matrix.arch }} Release)
+        run: cmake -S . -B _build/${{ matrix.arch }} -A ${{ matrix.arch }} -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build _build/${{ matrix.arch }} --config Release --parallel
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: XDB_${{ matrix.arch }}
+          path: |
+            _build/${{ matrix.arch }}/bin/Release/*.dll
+          retention-days: 1

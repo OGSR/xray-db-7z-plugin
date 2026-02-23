@@ -10,6 +10,7 @@
 #include "7zCrc.h"
 #include "XdbHandler.h"
 #include "xr_lzhuf.h"
+#include "xr_scrambler.h"
 
 extern "C" {
 #include "minilzo.h"
@@ -17,23 +18,25 @@ extern "C" {
 
 #include <algorithm>
 #include <string>
-#include <sstream>
 #include <vector>
 #include <unordered_map>
 #include <cstdlib>
 #include <cstdio>
 #include <fstream>
+#include <cstring>
+#include <stdexcept>
 
-// Minimal hook so xr_lzhuf links; aborts on fatal.
+// Minimal hook so xr_lzhuf links; throw on fatal so we can catch.
 namespace xray_re {
 void die(const char* message, const char* file, unsigned line) {
-    std::printf("xr_lzhuf die: %s:%u: %s\n", file, line, message);
-    std::abort();
+    throw std::runtime_error(std::string("xr_lzhuf die: ") + file + ":" + std::to_string(line) + ": " + message);
 }
 } // namespace xray_re
 
 namespace NArchive {
 namespace NXdb {
+
+using DBVersion = CHandler::DBVersion;
 
 static const UInt32 kChunkCompressedFlag = 0x80000000u;
 static const UInt32 kChunkIdMask         = ~kChunkCompressedFlag;
@@ -53,13 +56,14 @@ static const Byte kProps[] =
 
 enum
 {
-    kpidUserDataText = kpidUserDefined
+    kpidUserDataText = kpidUserDefined,
+    kpidDbFormat = kpidUserDefined + 1
 };
 
 static const CStatProp kArcProps[] =
 {
-    { NULL, kpidPhySize, VT_UI8 },
-    { "UserData", kpidUserDataText, VT_BSTR }
+    { "Userdata", kpidUserDataText, VT_BSTR },
+    { "DB-Format", kpidDbFormat, VT_BSTR }
 };
 
 IMP_IInArchive_Props
@@ -163,6 +167,298 @@ static inline void TrimTrailingSlashes(UString &path)
         path.DeleteBack();
 }
 
+static void NormalizePath(UString &path)
+{
+    path.MakeLower_Ascii();
+    path.Replace(L'/', L'\\');
+    TrimTrailingSlashes(path);
+}
+
+static void AddItemDedup(CObjectVector<CItem> &items, const CItem &item, bool dedup,
+                         std::unordered_map<std::wstring, unsigned> &lastByPath)
+{
+    if (!dedup)
+    {
+        items.Add(item);
+        return;
+    }
+
+    UString norm = item.Path;
+    norm.MakeLower_Ascii();
+    norm.Replace(L'/', L'\\');
+    const std::wstring key(norm);
+    auto it = lastByPath.find(key);
+    if (it == lastByPath.end())
+    {
+        lastByPath.emplace(key, (unsigned)items.Size());
+        items.Add(item);
+    }
+    else
+    {
+        items[(int)it->second] = item;
+    }
+}
+
+// LZHUF helper with hard limit and exception safety
+static bool DecompressLzhuf(const std::vector<Byte> &in, std::vector<Byte> &out, UInt64 maxOut)
+{
+    size_t outSize = 0;
+    uint8_t *outPtr = nullptr;
+    try
+    {
+        xray_re::xr_lzhuf::decompress(outPtr, outSize,
+            reinterpret_cast<const uint8_t*>(in.data()), in.size());
+    }
+    catch (...)
+    {
+        if (outPtr)
+            free(outPtr);
+        return false;
+    }
+
+    if (!outPtr || outSize == 0 || outSize > maxOut)
+    {
+        if (outPtr)
+            free(outPtr);
+        return false;
+    }
+
+    out.assign(outPtr, outPtr + outSize);
+    free(outPtr);
+    return true;
+}
+
+static bool ParseV2947(const Byte *start, const Byte *end, bool dedup, CObjectVector<CItem> &items)
+{
+    std::unordered_map<std::wstring, unsigned> lastByPath;
+    const Byte *p = start;
+    while (p < end)
+    {
+        if ((size_t)(end - p) < 2 + 4 + 4 + 4 + 4)
+            return false;
+
+        UInt16 nameField = ReadLE16(p); p += 2;
+        if (nameField < 16)
+            return false;
+
+        UInt32 nameLen = (UInt32)nameField - 16;
+        UInt32 sizeReal = ReadLE32(p); p += 4;
+        UInt32 sizeComp = ReadLE32(p); p += 4;
+        UInt32 crc = ReadLE32(p); p += 4;
+
+        if ((size_t)(end - p) < nameLen + 4)
+            return false;
+
+        std::string nameA((const char*)p, (size_t)nameLen);
+        p += nameLen;
+
+        UInt32 offset = ReadLE32(p); p += 4;
+
+        std::replace(nameA.begin(), nameA.end(), '\\', '/');
+
+        CItem it;
+        it.IsDir = (offset == 0);
+        it.Path = MultiByteToUnicodeString(nameA.c_str(), CP_ACP);
+        TrimTrailingSlashes(it.Path);
+        if (it.Path.IsEmpty())
+            continue;
+
+        it.Offset = offset;
+        it.Size = sizeReal;
+        it.PackSize = sizeComp;
+        it.Crc = crc;
+        it.UseLzhuf = false;
+
+        AddItemDedup(items, it, dedup, lastByPath);
+    }
+    return !items.IsEmpty();
+}
+
+static bool ParseV2945(const Byte *start, const Byte *end, bool dedup, CObjectVector<CItem> &items)
+{
+    std::unordered_map<std::wstring, unsigned> lastByPath;
+    const Byte *p = start;
+    while (p < end)
+    {
+        const char *nz = (const char*)memchr(p, 0, end - p);
+        if (!nz)
+            return false;
+
+        size_t nameLen = (size_t)(nz - (const char*)p);
+        std::string nameA((const char*)p, nameLen);
+        p = (const Byte*)(nz + 1);
+
+        if ((size_t)(end - p) < 4 + 4 + 4 + 4)
+            return false;
+
+        UInt32 crc = ReadLE32(p); p += 4;
+        UInt32 offset = ReadLE32(p); p += 4;
+        UInt32 sizeReal = ReadLE32(p); p += 4;
+        UInt32 sizeComp = ReadLE32(p); p += 4;
+
+        std::replace(nameA.begin(), nameA.end(), '\\', '/');
+
+        CItem it;
+        it.IsDir = (offset == 0);
+        it.Path = MultiByteToUnicodeString(nameA.c_str(), CP_ACP);
+        TrimTrailingSlashes(it.Path);
+        if (it.Path.IsEmpty())
+            continue;
+
+        it.Offset = offset;
+        it.Size = sizeReal;
+        it.PackSize = sizeComp;
+        it.Crc = crc;
+        it.UseLzhuf = false;
+
+        AddItemDedup(items, it, dedup, lastByPath);
+    }
+    return !items.IsEmpty();
+}
+
+static bool ParseV2215(const Byte *start, const Byte *end, bool dedup, CObjectVector<CItem> &items)
+{
+    std::unordered_map<std::wstring, unsigned> lastByPath;
+    const Byte *p = start;
+    while (p < end)
+    {
+        const char *nz = (const char*)memchr(p, 0, end - p);
+        if (!nz)
+            return false;
+
+        size_t nameLen = (size_t)(nz - (const char*)p);
+        std::string nameA((const char*)p, nameLen);
+        p = (const Byte*)(nz + 1);
+
+        if ((size_t)(end - p) < 4 + 4 + 4)
+            return false;
+
+        UInt32 offset = ReadLE32(p); p += 4;
+        UInt32 sizeReal = ReadLE32(p); p += 4;
+        UInt32 sizeComp = ReadLE32(p); p += 4;
+
+        std::replace(nameA.begin(), nameA.end(), '\\', '/');
+
+        CItem it;
+        it.IsDir = (offset == 0);
+        it.Path = MultiByteToUnicodeString(nameA.c_str(), CP_ACP);
+        TrimTrailingSlashes(it.Path);
+        if (it.Path.IsEmpty())
+            continue;
+
+        it.Offset = offset;
+        it.Size = sizeReal;
+        it.PackSize = sizeComp;
+        it.Crc = 0;
+        it.UseLzhuf = false;
+
+        AddItemDedup(items, it, dedup, lastByPath);
+    }
+    return !items.IsEmpty();
+}
+
+static bool ParseV11XX(const Byte *start, const Byte *end, bool dedup, CObjectVector<CItem> &items)
+{
+    std::unordered_map<std::wstring, unsigned> lastByPath;
+    const Byte *p = start;
+    while (p < end)
+    {
+        const char *nz = (const char*)memchr(p, 0, end - p);
+        if (!nz)
+            return false;
+
+        size_t nameLen = (size_t)(nz - (const char*)p);
+        std::string nameA((const char*)p, nameLen);
+        p = (const Byte*)(nz + 1);
+
+        if ((size_t)(end - p) < 4 + 4 + 4)
+            return false;
+
+        UInt32 uncompressedFlag = ReadLE32(p); p += 4;
+        UInt32 offset = ReadLE32(p); p += 4;
+        UInt32 sizeField = ReadLE32(p); p += 4;
+
+        std::replace(nameA.begin(), nameA.end(), '\\', '/');
+
+        CItem it;
+        it.IsDir = (offset == 0);
+        it.Path = MultiByteToUnicodeString(nameA.c_str(), CP_ACP);
+        TrimTrailingSlashes(it.Path);
+        if (it.Path.IsEmpty())
+            continue;
+
+        it.Offset = offset;
+        it.PackSize = sizeField;
+        it.Size = (uncompressedFlag != 0) ? sizeField : 0; // real size unknown when compressed
+        it.Crc = 0;
+        it.UseLzhuf = (uncompressedFlag == 0);
+
+        AddItemDedup(items, it, dedup, lastByPath);
+    }
+    return !items.IsEmpty();
+}
+
+static bool TryParseHeader(const std::vector<Byte> &payload, bool compressed,
+                           DBVersion candidate, UInt64 headerMax, bool dedup,
+                           CObjectVector<CItem> &outItems, DBVersion &detected)
+{
+    std::vector<Byte> plain;
+    if (compressed)
+    {
+        if (payload.size() < 4)
+            return false;
+
+        const UInt32 expected = ReadLE32(payload.data());
+        if (expected == 0 || expected > headerMax)
+            return false;
+
+        if (!DecompressLzhuf(payload, plain, headerMax))
+            return false;
+    }
+    else
+    {
+        plain = payload;
+    }
+
+    const Byte *start = plain.data();
+    const Byte *end = start + plain.size();
+
+    CObjectVector<CItem> parsed;
+
+    if (ParseV2947(start, end, dedup, parsed))
+    {
+        outItems = parsed;
+        detected = candidate;
+        return true;
+    }
+
+    parsed.Clear();
+    if (ParseV2945(start, end, dedup, parsed))
+    {
+        outItems = parsed;
+        detected = DBVersion::V2945;
+        return true;
+    }
+
+    parsed.Clear();
+    if (ParseV2215(start, end, dedup, parsed))
+    {
+        outItems = parsed;
+        detected = DBVersion::V2215;
+        return true;
+    }
+
+    parsed.Clear();
+    if (ParseV11XX(start, end, dedup, parsed))
+    {
+        outItems = parsed;
+        detected = DBVersion::V11XX;
+        return true;
+    }
+
+    return false;
+}
+
 // For signature probing: walk all chunks and ensure data+header exist and header is plausible.
 static HRESULT FindChunks(IInStream *s, UInt64 phySize,
                           UInt64 &dataChunkPos, UInt64 &dataChunkSize,
@@ -239,6 +535,11 @@ HRESULT CHandler::Parse()
     if (!_stream)
         return E_FAIL;
 
+    _items.Clear();
+    _userData.clear();
+    _hasUserData = false;
+    _dbVersion = DBVersion::UNKNOWN;
+
     UInt64 dataPos = 0, dataSize = 0, hdrPos = 0, hdrSize = 0;
     UInt64 userPos = 0, userSize = 0;
     UInt32 hdrIdRaw = 0;
@@ -250,105 +551,75 @@ HRESULT CHandler::Parse()
     if (fr != S_OK)
         return S_FALSE;
 
-    // Read header chunk payload
+    // Read header chunk payload (compressed or not)
     std::vector<Byte> hdrComp((size_t)hdrSize);
     RINOK(SeekAbs(_stream, hdrPos));
     RINOK(ReadExact(_stream, hdrComp.data(), hdrComp.size()));
 
-    // Decompress header if needed (LZHUF)
-    std::vector<Byte> hdrPlain;
     const bool hdrCompressed = (hdrIdRaw & kChunkCompressedFlag) != 0;
+    const UInt64 kHeaderMax = (_phySize > 0 && _phySize < (1ull << 26)) ? _phySize : (1ull << 26); // cap ~64MB or file size
 
-    if (hdrCompressed)
+    auto attempt_order = [&](const std::vector<DBVersion> &order) -> bool
     {
-        size_t outSize = 0;
-        uint8_t *outPtr = nullptr;
-        xray_re::xr_lzhuf::decompress(outPtr, outSize,
-            reinterpret_cast<const uint8_t*>(hdrComp.data()), hdrComp.size());
-        if (!outPtr || outSize == 0)
+        for (DBVersion v : order)
         {
-            if (outPtr)
-                free(outPtr);
-            return S_FALSE;
-        }
-        hdrPlain.assign(outPtr, outPtr + outSize);
-        free(outPtr); // allocated via malloc/realloc inside xr_lzhuf
-    }
-    else
-    {
-        hdrPlain.swap(hdrComp);
-    }
+            std::vector<Byte> payload;
+            bool compressed = hdrCompressed;
 
-    _items.Clear();
-    _userData.clear();
-    _hasUserData = false;
-
-    const Byte *p = hdrPlain.data();
-    const Byte *end = p + hdrPlain.size();
-
-    std::unordered_map<std::wstring, unsigned> lastByPath; // used only if dedup enabled
-
-    while (p < end)
-    {
-        // Need at least u16 + 4*u32 (min) before name
-        if ((size_t)(end - p) < 2 + 4 + 4 + 4 + 4)
-            break;
-
-        const UInt16 nameSizeField = ReadLE16(p); p += 2;
-        if (nameSizeField < 16)
-            return S_FALSE;
-
-        const UInt32 nameLen = (UInt32)nameSizeField - 16;
-
-        const UInt32 sizeReal = ReadLE32(p); p += 4;
-        const UInt32 sizeComp = ReadLE32(p); p += 4;
-        const UInt32 crc      = ReadLE32(p); p += 4;
-
-        if ((size_t)(end - p) < (size_t)nameLen + 4)
-            return S_FALSE;
-
-        std::string nameA((const char*)p, (size_t)nameLen);
-        p += nameLen;
-
-        const UInt32 offsetAbs = ReadLE32(p); p += 4;
-
-        std::replace(nameA.begin(), nameA.end(), '\\', '/');
-
-        CItem item;
-        item.IsDir = (offsetAbs == 0);
-        item.Path = MultiByteToUnicodeString(nameA.c_str(), CP_ACP); // XRay paths are typically ANSI/ASCII
-        TrimTrailingSlashes(item.Path);
-        item.Offset = offsetAbs;                                     // IMPORTANT: absolute offset
-        item.Size = sizeReal;
-        item.PackSize = sizeComp;
-        item.Crc = crc;
-
-        // Some headers may include empty entries; optionally skip them:
-        if (item.Path.IsEmpty())
-            continue;
-
-        if (_dedupPaths)
-        {
-            UString norm = item.Path;
-            norm.MakeLower_Ascii();
-            norm.Replace(L'/', L'\\');
-            const std::wstring key(norm);
-            auto it = lastByPath.find(key);
-            if (it == lastByPath.end())
+            if (v == DBVersion::V2947RU || v == DBVersion::V2947WW)
             {
-                lastByPath.emplace(key, (unsigned)_items.Size());
-                _items.Add(item);
+                if (!hdrCompressed)
+                    continue;
+
+                payload.resize(hdrComp.size());
+                xray_re::xr_scrambler scr(v == DBVersion::V2947RU
+                    ? xray_re::xr_scrambler::CC_RU
+                    : xray_re::xr_scrambler::CC_WW);
+                scr.decrypt(payload.data(), hdrComp.data(), hdrComp.size());
+
+                if (payload.size() < 4)
+                    continue;
+
+                const UInt32 expected = ReadLE32(payload.data());
+                if (expected == 0 || expected > kHeaderMax)
+                    continue;
+
+                compressed = true;
             }
             else
             {
-                _items[(int)it->second] = item; // replace with later occurrence (last wins)
+                payload = hdrComp;
+                compressed = hdrCompressed;
+            }
+
+            CObjectVector<CItem> parsed;
+            DBVersion detected = DBVersion::UNKNOWN;
+            if (TryParseHeader(payload, compressed, v, kHeaderMax, _dedupPaths, parsed, detected))
+            {
+                _items = parsed;
+                _dbVersion = detected;
+                return true;
             }
         }
-        else
-        {
-            _items.Add(item); // keep duplicates as-is
-        }
+        return false;
+    };
+
+    bool parsedOk = false;
+
+    if (_dbForce != DBVersion::UNKNOWN)
+    {
+        parsedOk = attempt_order({_dbForce});
     }
+    else
+    {
+        if (hdrCompressed)
+            parsedOk = attempt_order({DBVersion::V2947WW, DBVersion::V2947RU, DBVersion::XDB, DBVersion::V2945, DBVersion::V2215, DBVersion::V11XX});
+        else
+            parsedOk = attempt_order({DBVersion::XDB, DBVersion::V2945, DBVersion::V2215, DBVersion::V11XX});
+    }
+
+    if (!parsedOk)
+        return S_FALSE;
 
     // derive default compress policy for auto mode
     unsigned stored = 0, compressed = 0;
@@ -460,24 +731,48 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems, Int32 tes
         size_t dataSize = packed.size();
         std::vector<Byte> unpacked;
 
-        if (it.Size != it.PackSize)
-        {
-            // LZO1X
-            unpacked.resize((size_t)it.Size);
-            lzo_uint outLen = (lzo_uint)unpacked.size();
-            const int rc = lzo1x_decompress_safe(
-                packed.data(), (lzo_uint)packed.size(),
-                unpacked.data(), &outLen,
-                nullptr);
+    const bool needDecompress = (it.Size != it.PackSize) || it.UseLzhuf;
 
-            if (rc != LZO_E_OK || (UInt64)outLen != it.Size)
-            {
-                res = NArchive::NExtract::NOperationResult::kDataError;
+    if (needDecompress)
+    {
+        if (_dbVersion == DBVersion::V11XX && it.UseLzhuf)
+        {
+                uint8_t *outPtr = nullptr;
+                size_t outSize = 0;
+                xray_re::xr_lzhuf::decompress(outPtr, outSize,
+                    reinterpret_cast<const uint8_t*>(packed.data()), packed.size());
+                if (!outPtr || outSize == 0)
+                {
+                    if (outPtr) free(outPtr);
+                    res = NArchive::NExtract::NOperationResult::kDataError;
+                }
+                else
+                {
+                    unpacked.assign(outPtr, outPtr + outSize);
+                    free(outPtr);
+                    dataPtr = unpacked.data();
+                    dataSize = unpacked.size();
+                }
             }
             else
             {
-                dataPtr = unpacked.data();
-                dataSize = (size_t)outLen;
+                // LZO1X
+                unpacked.resize((size_t)it.Size);
+                lzo_uint outLen = (lzo_uint)unpacked.size();
+                const int rc = lzo1x_decompress_safe(
+                    packed.data(), (lzo_uint)packed.size(),
+                    unpacked.data(), &outLen,
+                    nullptr);
+
+                if (rc != LZO_E_OK || (UInt64)outLen != it.Size)
+                {
+                    res = NArchive::NExtract::NOperationResult::kDataError;
+                }
+                else
+                {
+                    dataPtr = unpacked.data();
+                    dataSize = (size_t)outLen;
+                }
             }
         }
 
@@ -519,6 +814,22 @@ Z7_COM7F_IMF(CHandler::GetArchiveProperty(PROPID propID, PROPVARIANT *value))
                 std::string chunk((const char*)_userData.data(), _userData.size());
                 prop = MultiByteToUnicodeString(chunk.c_str(), CP_ACP);
             }
+            break;
+        }
+        case kpidDbFormat:
+        {
+            const wchar_t *fmt = L"unknown";
+            switch (_dbVersion)
+            {
+                case DBVersion::XDB:      fmt = L"xdb"; break;
+                case DBVersion::V2947RU:  fmt = L"2947ru"; break;
+                case DBVersion::V2947WW:  fmt = L"2947ww"; break;
+                case DBVersion::V2945:    fmt = L"2945"; break;
+                case DBVersion::V2215:    fmt = L"2215"; break;
+                case DBVersion::V11XX:    fmt = L"11xx"; break;
+                default: break;
+            }
+            prop = fmt;
             break;
         }
         default: break;
@@ -600,6 +911,30 @@ Z7_COM7F_IMF(CHandler::SetProperties(const wchar_t * const *names, const PROPVAR
             _dedupPaths = !b;
             continue;
         }
+        if (name.IsEqualTo_Ascii_NoCase("dbver"))
+        {
+            if (val.vt != VT_BSTR || val.bstrVal == nullptr)
+                return E_INVALIDARG;
+            UString v(val.bstrVal);
+            v.MakeLower_Ascii();
+            if (v.IsEqualTo_Ascii_NoCase("auto"))
+                _dbForce = DBVersion::UNKNOWN;
+            else if (v.IsEqualTo_Ascii_NoCase("xdb"))
+                _dbForce = DBVersion::XDB;
+            else if (v.IsEqualTo_Ascii_NoCase("2947ru"))
+                _dbForce = DBVersion::V2947RU;
+            else if (v.IsEqualTo_Ascii_NoCase("2947ww"))
+                _dbForce = DBVersion::V2947WW;
+            else if (v.IsEqualTo_Ascii_NoCase("2945"))
+                _dbForce = DBVersion::V2945;
+            else if (v.IsEqualTo_Ascii_NoCase("2215"))
+                _dbForce = DBVersion::V2215;
+            else if (v.IsEqualTo_Ascii_NoCase("11xx"))
+                _dbForce = DBVersion::V11XX; // covers 1114/1154-style
+            else
+                return E_INVALIDARG;
+            continue;
+        }
         if (name.IsEqualTo_Ascii_NoCase("xdb_ud"))
         {
             _userData.clear();
@@ -662,9 +997,16 @@ Z7_COM7F_IMF(CHandler::UpdateItems(ISequentialOutStream *outStream, UInt32 numIt
     if (!outStream)
         return E_FAIL;
 
+    DBVersion effVer = (_dbForce != DBVersion::UNKNOWN) ? _dbForce
+                        : (_dbVersion != DBVersion::UNKNOWN ? _dbVersion : DBVersion::XDB);
+    if (effVer == DBVersion::UNKNOWN)
+        effVer = DBVersion::XDB;
+    _dbVersion = effVer;
+
     struct OutItem
     {
         bool IsDir = false;
+        bool UseLzhuf = false;
         UString Path;
         UInt64 Size = 0;
         UInt64 PackSize = 0;
@@ -715,6 +1057,7 @@ Z7_COM7F_IMF(CHandler::UpdateItems(ISequentialOutStream *outStream, UInt32 numIt
         {
             oi.Path = src->Path;
             oi.IsDir = src->IsDir;
+            oi.UseLzhuf = src->UseLzhuf;
         }
 
         TrimTrailingSlashes(oi.Path);
@@ -764,37 +1107,64 @@ Z7_COM7F_IMF(CHandler::UpdateItems(ISequentialOutStream *outStream, UInt32 numIt
 
             if (compressIt && !oi.Data.empty())
             {
-                static bool lzoInit = false;
-                if (!lzoInit)
+                if (effVer == DBVersion::V11XX)
                 {
-                    if (lzo_init() != LZO_E_OK)
-                        return E_FAIL;
-                    lzoInit = true;
-                }
-
-                // worst-case output buffer as per minilzo docs
-                std::vector<Byte> comp(oi.Data.size() + oi.Data.size() / 16 + 64 + 3);
-                lzo_uint outLen = 0;
-                std::vector<Byte> wrk(LZO1X_1_MEM_COMPRESS);
-                const int rc = lzo1x_1_compress(
-                    oi.Data.data(), (lzo_uint)oi.Data.size(),
-                    comp.data(), &outLen,
-                    wrk.data());
-
-                if (rc == LZO_E_OK && outLen > 0 && outLen < oi.Data.size())
-                {
-                    comp.resize(outLen);
-                    oi.PackSize = outLen;
-                    oi.Data.swap(comp);
+                    uint8_t *compPtr = nullptr;
+                    size_t compSize = 0;
+                    xray_re::xr_lzhuf::compress(compPtr, compSize,
+                        reinterpret_cast<const uint8_t*>(oi.Data.data()),
+                        oi.Data.size());
+                    if (!compPtr || compSize == 0 || compSize >= oi.Data.size())
+                    {
+                        if (compPtr) free(compPtr);
+                        oi.PackSize = (UInt64)oi.Data.size(); // store
+                        oi.UseLzhuf = false;
+                    }
+                    else
+                    {
+                        oi.PackSize = (UInt64)compSize;
+                        oi.Data.assign(compPtr, compPtr + compSize);
+                        oi.UseLzhuf = true;
+                        free(compPtr);
+                    }
                 }
                 else
                 {
-                    oi.PackSize = (UInt64)oi.Data.size(); // store
+                    static bool lzoInit = false;
+                    if (!lzoInit)
+                    {
+                        if (lzo_init() != LZO_E_OK)
+                            return E_FAIL;
+                        lzoInit = true;
+                    }
+
+                    // worst-case output buffer as per minilzo docs
+                    std::vector<Byte> comp(oi.Data.size() + oi.Data.size() / 16 + 64 + 3);
+                    lzo_uint outLen = 0;
+                    std::vector<Byte> wrk(LZO1X_1_MEM_COMPRESS);
+                    const int rc = lzo1x_1_compress(
+                        oi.Data.data(), (lzo_uint)oi.Data.size(),
+                        comp.data(), &outLen,
+                        wrk.data());
+
+                    if (rc == LZO_E_OK && outLen > 0 && outLen < oi.Data.size())
+                    {
+                        comp.resize(outLen);
+                        oi.PackSize = outLen;
+                        oi.Data.swap(comp);
+                        oi.UseLzhuf = false;
+                    }
+                    else
+                    {
+                        oi.PackSize = (UInt64)oi.Data.size(); // store
+                        oi.UseLzhuf = false;
+                    }
                 }
             }
             else
             {
                 oi.PackSize = (UInt64)oi.Data.size(); // store
+                oi.UseLzhuf = false;
             }
         }
         else if (src)
@@ -806,6 +1176,7 @@ Z7_COM7F_IMF(CHandler::UpdateItems(ISequentialOutStream *outStream, UInt32 numIt
             oi.SrcIndex = indexInArc;
             oi.SrcOffset = src->Offset;
             oi.SrcPackSize = src->PackSize;
+            oi.UseLzhuf = src->UseLzhuf;
         }
         else
         {
@@ -871,23 +1242,76 @@ Z7_COM7F_IMF(CHandler::UpdateItems(ISequentialOutStream *outStream, UInt32 numIt
     std::vector<Byte> hdrPlain;
     hdrPlain.reserve(outItems.Size() * 32);
 
-    for (unsigned i = 0; i < outItems.Size(); i++)
+    if (effVer == DBVersion::V2945)
     {
-        const OutItem &oi = outItems[i];
-        UString pathU = oi.Path;
-        pathU.MakeLower_Ascii();
-        pathU.Replace(L'/', L'\\');
-        AString pathA = UnicodeStringToMultiByte(pathU, CP_ACP);
-        const UInt32 nameLen = (UInt32)pathA.Len();
-        if (nameLen > 0xFFFF - 16)
-            return E_FAIL;
+        for (unsigned i = 0; i < outItems.Size(); i++)
+        {
+            const OutItem &oi = outItems[i];
+            UString pathU = oi.Path;
+            pathU.MakeLower_Ascii();
+            pathU.Replace(L'/', L'\\');
+            AString pathA = UnicodeStringToMultiByte(pathU, CP_ACP);
+            hdrPlain.insert(hdrPlain.end(), (const Byte*)pathA.Ptr(), (const Byte*)pathA.Ptr() + pathA.Len());
+            hdrPlain.push_back(0); // null terminator
+            WriteLE32(hdrPlain, oi.Crc);
+            WriteLE32(hdrPlain, (UInt32)oi.Offset);
+            WriteLE32(hdrPlain, (UInt32)oi.Size);
+            WriteLE32(hdrPlain, (UInt32)oi.PackSize);
+        }
+    }
+    else if (effVer == DBVersion::V2215)
+    {
+        for (unsigned i = 0; i < outItems.Size(); i++)
+        {
+            const OutItem &oi = outItems[i];
+            UString pathU = oi.Path;
+            pathU.MakeLower_Ascii();
+            pathU.Replace(L'/', L'\\');
+            AString pathA = UnicodeStringToMultiByte(pathU, CP_ACP);
+            hdrPlain.insert(hdrPlain.end(), (const Byte*)pathA.Ptr(), (const Byte*)pathA.Ptr() + pathA.Len());
+            hdrPlain.push_back(0); // null terminator
+            WriteLE32(hdrPlain, (UInt32)oi.Offset);
+            WriteLE32(hdrPlain, (UInt32)oi.Size);
+            WriteLE32(hdrPlain, (UInt32)oi.PackSize);
+        }
+    }
+    else if (effVer == DBVersion::V11XX)
+    {
+        for (unsigned i = 0; i < outItems.Size(); i++)
+        {
+            const OutItem &oi = outItems[i];
+            UString pathU = oi.Path;
+            pathU.MakeLower_Ascii();
+            pathU.Replace(L'/', L'\\');
+            AString pathA = UnicodeStringToMultiByte(pathU, CP_ACP);
+            hdrPlain.insert(hdrPlain.end(), (const Byte*)pathA.Ptr(), (const Byte*)pathA.Ptr() + pathA.Len());
+            hdrPlain.push_back(0); // null terminator
+            UInt32 uncompressedFlag = (oi.PackSize == oi.Size) ? 1u : 0u;
+            WriteLE32(hdrPlain, uncompressedFlag);
+            WriteLE32(hdrPlain, (UInt32)oi.Offset);
+            WriteLE32(hdrPlain, (UInt32)oi.PackSize);
+        }
+    }
+    else // Xdb / 2947
+    {
+        for (unsigned i = 0; i < outItems.Size(); i++)
+        {
+            const OutItem &oi = outItems[i];
+            UString pathU = oi.Path;
+            pathU.MakeLower_Ascii();
+            pathU.Replace(L'/', L'\\');
+            AString pathA = UnicodeStringToMultiByte(pathU, CP_ACP);
+            const UInt32 nameLen = (UInt32)pathA.Len();
+            if (nameLen > 0xFFFF - 16)
+                return E_FAIL;
 
-        WriteLE16(hdrPlain, (UInt16)(nameLen + 16));
-        WriteLE32(hdrPlain, (UInt32)oi.Size);
-        WriteLE32(hdrPlain, (UInt32)oi.PackSize);
-        WriteLE32(hdrPlain, oi.Crc);
-        hdrPlain.insert(hdrPlain.end(), (const Byte*)pathA.Ptr(), (const Byte*)pathA.Ptr() + nameLen);
-        WriteLE32(hdrPlain, (UInt32)oi.Offset);
+            WriteLE16(hdrPlain, (UInt16)(nameLen + 16));
+            WriteLE32(hdrPlain, (UInt32)oi.Size);
+            WriteLE32(hdrPlain, (UInt32)oi.PackSize);
+            WriteLE32(hdrPlain, oi.Crc);
+            hdrPlain.insert(hdrPlain.end(), (const Byte*)pathA.Ptr(), (const Byte*)pathA.Ptr() + nameLen);
+            WriteLE32(hdrPlain, (UInt32)oi.Offset);
+        }
     }
 
     uint8_t *hdrCompPtr = nullptr;
@@ -899,6 +1323,17 @@ Z7_COM7F_IMF(CHandler::UpdateItems(ISequentialOutStream *outStream, UInt32 numIt
         return E_FAIL;
     std::vector<Byte> hdrComp(hdrCompPtr, hdrCompPtr + hdrCompSize);
     free(hdrCompPtr);
+
+    // Optional scramble for 2947 RU/WW
+    if (effVer == DBVersion::V2947RU || effVer == DBVersion::V2947WW)
+    {
+        xray_re::xr_scrambler scr(effVer == DBVersion::V2947RU
+            ? xray_re::xr_scrambler::CC_RU
+            : xray_re::xr_scrambler::CC_WW);
+        std::vector<Byte> tmp(hdrComp.size());
+        scr.encrypt(tmp.data(), hdrComp.data(), hdrComp.size());
+        hdrComp.swap(tmp);
+    }
 
     // ensure total archive size fits 32-bit offsets (include header chunk header, and optional userdata)
     UInt64 totalSize = dataChunkStart + dataChunkSize + 8ULL + hdrComp.size();
@@ -937,8 +1372,8 @@ Z7_COM7F_IMF(CHandler::UpdateItems(ISequentialOutStream *outStream, UInt32 numIt
     if (!hdrComp.empty())
         RINOK(WriteAll(outStream, hdrComp.data(), hdrComp.size()));
 
-    // append userdata chunk if present
-    if (_hasUserData && !_userData.empty())
+    // append userdata chunk if present and format supports it (XDB only)
+    if (effVer == DBVersion::XDB && _hasUserData && !_userData.empty())
     {
         const UInt32 userChunkId = kDbChunkUserData;
         const UInt32 userSize32 = (UInt32)_userData.size();
@@ -961,7 +1396,7 @@ Z7_COM7F_IMF(CHandler::UpdateItems(ISequentialOutStream *outStream, UInt32 numIt
         _items.Add(it);
     }
     _phySize = dataChunkStart + dataChunkSize + 8 + hdrComp.size();
-    if (_hasUserData && !_userData.empty())
+    if (effVer == DBVersion::XDB && _hasUserData && !_userData.empty())
         _phySize += 8 + _userData.size();
 
     return cb->SetOperationResult(NArchive::NUpdate::NOperationResult::kOK);

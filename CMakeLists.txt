@@ -19,8 +19,9 @@ endif()
 set(SRC_XDB
   ${ROOT}/CPP/7zip/Archive/Xdb/XdbHandler.cpp
   ${ROOT}/CPP/7zip/Archive/Xdb/XdbRegister.cpp
-  ${ROOT}/third_party/minilzo/minilzo.c
+  ${ROOT}/third_party/xray_re-tools/sources/utils/converter/lzo/minilzo.c
   ${ROOT}/third_party/xray_re-tools/sources/xray_re/xr_lzhuf.cxx
+  ${ROOT}/third_party/xray_re-tools/sources/xray_re/xr_scrambler.cxx
   ${Z7_ROOT}/CPP/7zip/Archive/ArchiveExports.cpp
   ${Z7_ROOT}/CPP/7zip/Archive/DllExports2.cpp
 )
@@ -107,7 +108,7 @@ add_library(Xdb SHARED
 
 target_include_directories(Xdb PRIVATE
   ${ROOT}/CPP/7zip/Archive/Xdb
-  ${ROOT}/third_party/minilzo
+  ${ROOT}/third_party/xray_re-tools/sources/utils/converter/lzo
   ${ROOT}/third_party/xray_re-tools/sources/xray_re
   ${Z7_ROOT}/CPP
   ${Z7_ROOT}/CPP/include

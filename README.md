@@ -1,45 +1,68 @@
-Minimal XDB 7‑Zip plugin
-========================
+# Xray DB 7z Plugin
 
-This folder is a trimmed copy of the 7‑Zip sources containing only what’s needed to build the XDB format handler.
+## 📜 Description
 
-Prereq
-- If the `third_party/7zip` folder is missing, fetch upstream 7-Zip sources as a submodule:
-  ```
-  git submodule update --init --recursive
-  ```
+**Xray DB 7z Plugin** is a 7‑Zip format handler for S.T.A.L.K.E.R. database archives (XDB / 11xx / 2215 / 2945 / 2947 RU & WW). It lets you open, extract, update, delete, and create archives directly in 7‑Zip while preserving scrambling, compression, and userdata.
 
-Build
-1) Configure & build:
+## ✨ Features
+
+- Read/write support for XDB, 2947RU, 2947WW, 2945, 2215, 1114, 1154 variants
+- Auto‑detects format on open; configurable override for new archives
+- Honors per‑entry compression vs. store and keeps scrambling rules intact
+- Optional userdata embedding; shown read‑only in 7‑Zip as **UserData**
+- Duplicate-path control (dedup on by default) and delete support
+- Safety checks: offset bounds, CRC verification on read, header size cap
+
+## 📦 Installation
+
+1) Download the latest release zip from GitHub
+2) Pick the DLL that matches your 7‑Zip install:  
+   - `XDB_x64.dll` for 64‑bit 7‑Zip (most installs)
+   - `XDB_Win32.dll` only if you explicitly run 32‑bit 7‑Zip
+3) Copy the DLL into your 7‑Zip `Formats` directory (e.g., `C:\Program Files\7-Zip\Formats`). Create the `Formats` folder if it isn’t there.  
+
+## 🛠 Build
+
+1. **Fetch submodules**
+   ```pwsh
+   git submodule update --init --recursive
    ```
+2. **Configure & build (x64)**
+   ```pwsh
    cmake -S . -B _build/x64 -G "Visual Studio 17 2022" -A x64
-   cmake --build _build/x64 --config Release --target Xdb
+   cmake --build _build/x64 --config Release
    ```
-2) DLL lands at `_build/x64/bin/Release/XDB_x64.dll`; drop it into the 7-Zip `Formats` directory.
+   Win32 build: replace `-A x64` with `-A Win32` and use `_build/Win32`.
 
-Contents
-- `CPP/7zip/Archive/Xdb`: XDB handler + LZHUF/LZO helpers (your custom code).
-- `third_party/7zip`: upstream submodule providing all other 7‑Zip headers/sources pulled in by CMake.
+3. **Result**
+   - `_build/x64/bin/Release/XDB_x64.dll`
+   - `_build/Win32/bin/Release/XDB_Win32.dll`
 
-Notes
-- The CMake list enumerates every compiled source; if you trim further, update it accordingly.
-- This tree intentionally omits all other formats, UI, and bundles to keep the plugin surface obvious.
+## 🧭 Usage in 7‑Zip
 
-Usage in 7‑Zip
---------------
-Pick format **Xdb** when adding/creating an archive. All per‑format options are passed through the **Parameters** box (7‑Zip doesn’t offer custom UI for plugins).
+Choose format **xdb**. Parameters go into 7‑Zip’s **Parameters** box (comma‑separated or space‑separated):
 
-Supported parameters:
-- `compress=auto|true|false` (default `auto`): compression mode for new/modified files. `auto` mirrors the existing archive’s store/compress mix (for a brand‑new archive it defaults to store); `true` always compresses; `false` always stores.
-- `x=<level>`: standard 7‑Zip “Compression level” value. `0` forces store, any other level forces compress (alias for `compress=true/false`).
-- `keepdups=true|false` (default `false`): `true` keeps duplicate paths, `false` keeps only the last occurrence (dedup on).
-- `xdb_ud=<path>`: embed userdata from an external file (bytes are copied verbatim into the userdata chunk).
+- `compress=auto|true|false` (default `auto`): compress new/modified files based on existing archive mix (`auto`), always (`true`), or never (`false`).
+- `dbver=auto|xdb|2947ru|2947ww|2945|2215|11xx` (default `auto`): force a variant for new archives or override detection.
+- `keepdups=true|false` (default `false`): keep duplicate paths or keep only the last occurrence.
+- `xdb_ud=PATH`: embed userdata from a file (bytes copied verbatim; only written for XDB).
 
-Viewing userdata:
-- Open the archive properties pane in 7‑Zip and read the custom **UserData** property (full text, read‑only)
+Archive properties shown in 7‑Zip:
+- **Userdata**: full userdata text
+- **DB-Format**: detected variant
 
 Other behavior:
-- Deletes: marking an item as “anti” in the update callback removes it on save.
-- CRC verification: existing entries are checked when read; new data CRC is stored over uncompressed bytes.
-- Safety limits: offsets/ranges validated; archive size limited to 32‑bit offsets (format constraint).
-- The 7‑Zip compression level dropdown is honored via `x=` as described above.
+- Deletes: items marked “anti” in the update callback are removed on save.
+- CRC: verified on read when CRC is present.
+- Header safety: decompression capped and validated to avoid runaway buffers.
+
+## 📂 Layout
+
+- `CPP/7zip/Archive/Xdb` - plugin sources
+- `third_party/7zip` - upstream 7‑Zip sources
+- `third_party/xray_re-tools` - legacy helper code
+
+## 📄 License
+
+* Plugin-specific code: MIT (see `LICENSE`)
+* Third-party code keeps its own licenses (see `NOTICE`)

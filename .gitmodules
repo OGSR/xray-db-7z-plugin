@@ -1,9 +1,6 @@
 [submodule "third_party/7zip"]
 	path = third_party/7zip
 	url = https://github.com/ip7z/7zip
-[submodule "third_party/minilzo"]
-	path = third_party/minilzo
-	url = https://github.com/yuhaoth/minilzo
 [submodule "third_party/xray_re-tools"]
 	path = third_party/xray_re-tools
 	url = https://github.com/abramcumner/xray_re-tools
