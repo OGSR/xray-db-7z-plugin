@@ -6,6 +6,7 @@
 #include "Common/MyTypes.h"
 
 #include "Archive/IArchive.h"
+#include <vector>
 
 namespace NArchive {
 namespace NXdb {
@@ -20,13 +21,17 @@ struct CItem
     UInt32 Crc = 0;
 };
 
-Z7_CLASS_IMP_CHandler_IInArchive_1(ISetProperties)
+Z7_CLASS_IMP_CHandler_IInArchive_2(ISetProperties, IOutArchive)
 
 private:
     CMyComPtr<IInStream> _stream;
     UInt64 _phySize = 0;
     CObjectVector<CItem> _items;
-    bool _includeUserData = false;
+    bool _dedupPaths = true;
+    enum class ECompressMode { Auto, Always, Never } _compressMode = ECompressMode::Auto;
+    bool _autoCompressDefault = false; // derived from existing items (auto mode)
+    bool _hasUserData = false;
+    std::vector<Byte> _userData;
 
     HRESULT Parse();
 };

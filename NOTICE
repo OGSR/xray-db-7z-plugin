@@ -12,4 +12,8 @@ license. Use is based on the permission statement from the
 upstream project: "you can do whatever you want, just do not
 say you wrote it."
 
+This project also bundles:
+- 7-Zip source code (third_party/7zip), primarily under the GNU LGPL v2.1 or later, with BSD-licensed files and an unRAR license restriction for RAR code. See third_party/7zip/DOC/License.txt and unRarLicense.txt.
+- minilzo (third_party/minilzo), licensed under the GNU GPL v2 (see third_party/minilzo/COPYING).
+
 All third-party components remain under their respective licenses.
