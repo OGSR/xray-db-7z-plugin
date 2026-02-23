@@ -42,7 +42,8 @@ private:
     CObjectVector<CItem> _items;
     bool _dedupPaths = true;
     enum class ECompressMode { Auto, Always, Never } _compressMode = ECompressMode::Auto;
-    bool _autoCompressDefault = false; // derived from existing items (auto mode)
+    bool _autoCompressDefault = true; // fallback for new/empty archives (auto mode)
+    bool _genXdbUserData = true;
     bool _hasUserData = false;
     std::vector<Byte> _userData;
     DBVersion _dbVersion = DBVersion::UNKNOWN;

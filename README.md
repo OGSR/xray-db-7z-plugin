@@ -2,16 +2,16 @@
 
 ## 📜 Description
 
-**Xray DB 7z Plugin** is a 7‑Zip format handler for S.T.A.L.K.E.R. database archives (XDB / 11xx / 2215 / 2945 / 2947 RU & WW). It lets you open, extract, update, delete, and create archives directly in 7‑Zip while preserving scrambling, compression, and userdata.
+**Xray DB 7z Plugin** lets you work with S.T.A.L.K.E.R. game archives in 7-Zip like normal archives. You can browse files, edit content, and build new mod archives without extra tools.
 
-## ✨ Features
+## 📋 Features
 
-- Read/write support for XDB, 2947RU, 2947WW, 2945, 2215, 1114, 1154 variants
-- Auto‑detects format on open; configurable override for new archives
-- Honors per‑entry compression vs. store and keeps scrambling rules intact
-- Optional userdata embedding; shown read‑only in 7‑Zip as **UserData**
-- Duplicate-path control (dedup on by default) and delete support
-- Safety checks: offset bounds, CRC verification on read, header size cap
+- Open, extract, and create S.T.A.L.K.E.R. DB archives directly with 7-Zip
+- Supports XDB, 2947WW, 2947RU, 2945, 2215, 1114 and 1154 archives
+- Edit archives in place (add, replace, rename, delete files and folders)
+- Keeps game-compatible archive behavior (compression, scrambling, userdata handling)
+- Auto-detects archive format and uses sensible defaults for new archives
+- Optional userdata from file, with automatic fallback userdata for new XDB archives
 
 ## 📦 Installation
 
@@ -27,12 +27,16 @@
    ```pwsh
    git submodule update --init --recursive
    ```
-2. **Configure & build (x64)**
+2. **Configure & build**
    ```pwsh
    cmake -S . -B _build/x64 -G "Visual Studio 17 2022" -A x64
    cmake --build _build/x64 --config Release
    ```
-   Win32 build: replace `-A x64` with `-A Win32` and use `_build/Win32`.
+   * Win32 build: replace `-A x64` with `-A Win32` and use `_build/Win32`.
+
+   * Tested supported generators:
+     - `Visual Studio 17 2022`
+     - `Visual Studio 18 2026`
 
 3. **Result**
    - `_build/x64/bin/Release/XDB_x64.dll`
@@ -40,21 +44,32 @@
 
 ## 🧭 Usage in 7‑Zip
 
-Choose format **xdb**. Parameters go into 7‑Zip’s **Parameters** box (comma‑separated or space‑separated):
+Parameters:
+- `compress=auto|true|false` (default `auto`)
+  - Existing archive: `auto` follows the archive's current mix of compressed vs stored files
+  - New archive: `auto` defaults to `true`
+- `dbver=auto|xdb|2947ww|2947ru|2945|2215|11xx` (default `auto`)
+  - Existing archive: `auto` keeps the detected format
+  - New archive: `auto` defaults to `xdb`
+- `xdb_ud=PATH`: embed userdata from a file (bytes copied verbatim; only written for XDB)
+  - If the path contains spaces, quote it with either `"` or `'`
+- `gen_xdb_ud=true|false` (default `true`): if no `xdb_ud` is provided and the selected format resolves to `xdb`, a fallback userdata block is generated automatically
+  - If `xdb_ud` is provided, it is always used instead of the generated fallback
+- `keepdups=true|false` (default `false`): keep duplicate paths or keep only the last occurrence (used for incorrect archives)
 
-- `compress=auto|true|false` (default `auto`): compress new/modified files based on existing archive mix (`auto`), always (`true`), or never (`false`).
-- `dbver=auto|xdb|2947ru|2947ww|2945|2215|11xx` (default `auto`): force a variant for new archives or override detection.
-- `keepdups=true|false` (default `false`): keep duplicate paths or keep only the last occurrence.
-- `xdb_ud=PATH`: embed userdata from a file (bytes copied verbatim; only written for XDB).
+Game format notes:
+- Most S.T.A.L.K.E.R. games use `xdb`
+- **Shadow of Chernobyl** uses `2947ww` (World Wide) or `2947ru` (Russian release)
+
+Examples:
+- Add to `Parameters` field: `compress=true xdb_ud="D:\Mods\my mod\userdata.ltx"`
+- Add to `Parameters` field: `compress=false dbver=2947ww xdb_ud='D:\Mods\my mod\userdata.ltx'`
+- `7z.exe`: `7z a mymod.db0 .\gamedata\* -txdb -mdbver=xdb`
+- `7z.exe`: `7z a mymod.db0 .\gamedata\* -txdb -mdbver=xdb -mgen_xdb_ud=false`
 
 Archive properties shown in 7‑Zip:
 - **Userdata**: full userdata text
 - **DB-Format**: detected variant
-
-Other behavior:
-- Deletes: items marked “anti” in the update callback are removed on save.
-- CRC: verified on read when CRC is present.
-- Header safety: decompression capped and validated to avoid runaway buffers.
 
 ## 📂 Layout
 

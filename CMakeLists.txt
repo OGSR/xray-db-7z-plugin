@@ -1,14 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 project(xdb_plugin LANGUAGES C CXX)
 
-# Standalone XDB format plugin for 7-Zip.
-# Builds produce platform-suffixed DLLs:
-#   x64  -> cmake -S . -B _build/x64 -G "Visual Studio 17 2022" -A x64
-#           cmake --build _build/x64 --config Release
-#   Win32-> cmake -S . -B _build/Win32 -G "Visual Studio 17 2022" -A Win32
-#           cmake --build _build/Win32 --config Release
-# Result: _build/<arch>/bin/Release/XDB_<arch>.dll (drop into 7-Zip/Formats)
-
 set(ROOT ${CMAKE_CURRENT_LIST_DIR})
 set(Z7_ROOT ${ROOT}/third_party/7zip)
 

@@ -409,11 +409,19 @@ static bool TryParseHeader(const std::vector<Byte> &payload, bool compressed,
             return false;
 
         const UInt32 expected = ReadLE32(payload.data());
-        if (expected == 0 || expected > headerMax)
+        if (expected > headerMax)
             return false;
 
-        if (!DecompressLzhuf(payload, plain, headerMax))
-            return false;
+        if (expected == 0)
+        {
+            // Empty headers are valid for empty archives.
+            plain.clear();
+        }
+        else
+        {
+            if (!DecompressLzhuf(payload, plain, headerMax))
+                return false;
+        }
     }
     else
     {
@@ -453,6 +461,13 @@ static bool TryParseHeader(const std::vector<Byte> &payload, bool compressed,
     {
         outItems = parsed;
         detected = DBVersion::V11XX;
+        return true;
+    }
+
+    if (plain.empty())
+    {
+        outItems.Clear();
+        detected = candidate;
         return true;
     }
 
@@ -557,7 +572,13 @@ HRESULT CHandler::Parse()
     RINOK(ReadExact(_stream, hdrComp.data(), hdrComp.size()));
 
     const bool hdrCompressed = (hdrIdRaw & kChunkCompressedFlag) != 0;
-    const UInt64 kHeaderMax = (_phySize > 0 && _phySize < (1ull << 26)) ? _phySize : (1ull << 26); // cap ~64MB or file size
+    // Allow small archives whose unpacked header can be larger than total archive size,
+    // but still keep a hard safety cap for malformed inputs.
+    UInt64 kHeaderMax = _phySize;
+    if (kHeaderMax < (1ull << 26)) // 64 MiB minimum cap
+        kHeaderMax = (1ull << 26);
+    if (kHeaderMax > (1ull << 28)) // 256 MiB hard ceiling
+        kHeaderMax = (1ull << 28);
 
     auto attempt_order = [&](const std::vector<DBVersion> &order) -> bool
     {
@@ -581,7 +602,7 @@ HRESULT CHandler::Parse()
                     continue;
 
                 const UInt32 expected = ReadLE32(payload.data());
-                if (expected == 0 || expected > kHeaderMax)
+                if (expected > kHeaderMax)
                     continue;
 
                 compressed = true;
@@ -633,7 +654,7 @@ HRESULT CHandler::Parse()
         else
             compressed++;
     }
-    _autoCompressDefault = (compressed > stored);
+    _autoCompressDefault = (compressed == 0 && stored == 0) || (compressed > stored);
 
     if (userPos && userSize)
     {
@@ -643,7 +664,7 @@ HRESULT CHandler::Parse()
         _hasUserData = true;
     }
 
-    return _items.IsEmpty() ? S_FALSE : S_OK;
+    return S_OK;
 }
 
 Z7_COM7F_IMF(CHandler::GetNumberOfItems(UInt32 *numItems))
@@ -660,7 +681,15 @@ Z7_COM7F_IMF(CHandler::GetProperty(UInt32 index, PROPID propID, PROPVARIANT *val
 
     switch (propID)
     {
-        case kpidPath:      prop = it.Path; break;
+        case kpidPath:
+        {
+            UString path = it.Path;
+            // 7-Zip agent rename logic compares OS-style paths.
+            // Returning native separators avoids false "Parameter is incorrect" errors.
+            path.Replace(L'/', WCHAR_PATH_SEPARATOR);
+            prop = path;
+            break;
+        }
         case kpidIsDir:     prop = it.IsDir; break;
         case kpidSize:      if (!it.IsDir) prop = (UInt64)it.Size; break;
         case kpidPackSize:  if (!it.IsDir) prop = (UInt64)it.PackSize; break;
@@ -893,6 +922,185 @@ static bool PropToUInt32(const PROPVARIANT &v, UInt32 &res)
     }
 }
 
+static bool PropToUString(const PROPVARIANT &v, UString &res)
+{
+    res.Empty();
+    switch (v.vt)
+    {
+        case VT_EMPTY:
+            return true;
+        case VT_BSTR:
+            if (v.bstrVal)
+                res = v.bstrVal;
+            return true;
+        case VT_BOOL:
+            res = (v.boolVal != VARIANT_FALSE) ? L"true" : L"false";
+            return true;
+        case VT_UI1:
+        {
+            char tmp[16];
+            std::snprintf(tmp, sizeof(tmp), "%u", (unsigned)v.bVal);
+            res = MultiByteToUnicodeString(tmp, CP_ACP);
+            return true;
+        }
+        case VT_UI2:
+        {
+            char tmp[16];
+            std::snprintf(tmp, sizeof(tmp), "%u", (unsigned)v.uiVal);
+            res = MultiByteToUnicodeString(tmp, CP_ACP);
+            return true;
+        }
+        case VT_UI4:
+        {
+            char tmp[16];
+            std::snprintf(tmp, sizeof(tmp), "%u", (unsigned)v.ulVal);
+            res = MultiByteToUnicodeString(tmp, CP_ACP);
+            return true;
+        }
+        case VT_I4:
+        {
+            char tmp[16];
+            std::snprintf(tmp, sizeof(tmp), "%d", (int)v.lVal);
+            res = MultiByteToUnicodeString(tmp, CP_ACP);
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+static void TrimWs(UString &s)
+{
+    while (s.Len() != 0 && (s[0] == L' ' || s[0] == L'\t'))
+        s.Delete(0, 1);
+    while (s.Len() != 0 && (s.Back() == L' ' || s.Back() == L'\t'))
+        s.DeleteBack();
+}
+
+static void StripOuterQuotes(UString &s)
+{
+    for (;;)
+    {
+        if (s.Len() < 2)
+            return;
+        const wchar_t front = s[0];
+        const wchar_t back = s.Back();
+        if ((front == L'"' && back == L'"') || (front == L'\'' && back == L'\''))
+        {
+            s.Delete(0, 1);
+            s.DeleteBack();
+            continue;
+        }
+        return;
+    }
+}
+
+static bool ReadFileToBytes_Wide(const UString &path, std::vector<Byte> &data)
+{
+    data.clear();
+
+#if defined(_WIN32)
+    FILE *f = nullptr;
+#if defined(_MSC_VER)
+    if (_wfopen_s(&f, path.Ptr(), L"rb") != 0 || f == nullptr)
+        return false;
+#else
+    f = _wfopen(path.Ptr(), L"rb");
+    if (f == nullptr)
+        return false;
+#endif
+
+    if (_fseeki64(f, 0, SEEK_END) != 0)
+    {
+        fclose(f);
+        return false;
+    }
+
+    const __int64 len64 = _ftelli64(f);
+    if (len64 < 0)
+    {
+        fclose(f);
+        return false;
+    }
+
+    if (_fseeki64(f, 0, SEEK_SET) != 0)
+    {
+        fclose(f);
+        return false;
+    }
+
+    data.resize((size_t)len64);
+    if (len64 > 0)
+    {
+        const size_t need = (size_t)len64;
+        const size_t got = fread(data.data(), 1, need, f);
+        if (got != need)
+        {
+            fclose(f);
+            data.clear();
+            return false;
+        }
+    }
+
+    fclose(f);
+    return true;
+#else
+    AString pathA = UnicodeStringToMultiByte(path, CP_UTF8);
+    std::ifstream f(pathA.Ptr(), std::ios::binary);
+    if (!f)
+        return false;
+    f.seekg(0, std::ios::end);
+    std::streamoff len = f.tellg();
+    if (len < 0)
+        return false;
+    data.resize((size_t)len);
+    f.seekg(0, std::ios::beg);
+    if (len > 0)
+        f.read((char*)data.data(), len);
+    return true;
+#endif
+}
+
+static bool LoadUserDataFile(const UString &rawPath, std::vector<Byte> &dataOut)
+{
+    UString path = rawPath;
+    TrimWs(path);
+    StripOuterQuotes(path);
+    TrimWs(path);
+    if (path.IsEmpty())
+        return false;
+    return ReadFileToBytes_Wide(path, dataOut);
+}
+
+static bool BuildRawPropertyToken(const wchar_t *name, const PROPVARIANT &val, UString &token)
+{
+    token = name;
+    if (val.vt == VT_EMPTY)
+        return true;
+
+    UString value;
+    if (!PropToUString(val, value))
+        return false;
+    token += L"=";
+    token += value;
+    return true;
+}
+
+static std::vector<Byte> MakeGeneratedXdbUserData()
+{
+    static const char kDefaultUserData[] =
+        "[header]\n"
+        "auto_load = true\n"
+        "level_name = stalker\n"
+        "level_ver = 1.0\n"
+        "entry_point = $fs_root$\\gamedata\\\n"
+        "creator = \"Modder\"\n"
+        "link = \"https://github.com/Tosox/xray-db-7z-plugin\"\n";
+
+    const Byte *begin = reinterpret_cast<const Byte*>(kDefaultUserData);
+    return std::vector<Byte>(begin, begin + sizeof(kDefaultUserData) - 1);
+}
+
 Z7_COM7F_IMF(CHandler::SetProperties(const wchar_t * const *names, const PROPVARIANT *values, UInt32 numProps))
 {
     COM_TRY_BEGIN
@@ -940,27 +1148,65 @@ Z7_COM7F_IMF(CHandler::SetProperties(const wchar_t * const *names, const PROPVAR
             _userData.clear();
             _hasUserData = false;
 
-            if (val.vt != VT_BSTR || val.bstrVal == nullptr)
+            UString pathValue;
+            if (!PropToUString(val, pathValue))
                 return E_INVALIDARG;
 
-            AString pathA = UnicodeStringToMultiByte(UString(val.bstrVal), CP_ACP);
-            std::ifstream f(pathA.Ptr(), std::ios::binary);
-            if (!f)
+            UString mergedPath = pathValue;
+            UInt32 consumedTo = i;
+            bool loaded = LoadUserDataFile(mergedPath, _userData);
+
+            // GUI parameter parsing splits by spaces without quote awareness.
+            // Re-join following tokens only for quoted xdb_ud values.
+            if (!loaded)
+            {
+                UString trimmed = mergedPath;
+                TrimWs(trimmed);
+
+                wchar_t quote = 0;
+                if (!trimmed.IsEmpty() && (trimmed[0] == L'"' || trimmed[0] == L'\''))
+                    quote = trimmed[0];
+
+                bool quoteClosed = false;
+                if (quote != 0)
+                {
+                    if (trimmed.Len() >= 2 && trimmed.Back() == quote)
+                        quoteClosed = true;
+
+                    for (UInt32 j = i + 1; j < numProps && !quoteClosed; j++)
+                    {
+                        UString token;
+                        if (!BuildRawPropertyToken(names[j], values[j], token))
+                            return E_INVALIDARG;
+                        mergedPath += L" ";
+                        mergedPath += token;
+                        consumedTo = j;
+                        if (!token.IsEmpty() && token.Back() == quote)
+                            quoteClosed = true;
+                    }
+
+                    loaded = LoadUserDataFile(mergedPath, _userData);
+                }
+            }
+
+            if (!loaded)
                 return E_INVALIDARG;
-            f.seekg(0, std::ios::end);
-            std::streamoff len = f.tellg();
-            if (len < 0)
-                return E_INVALIDARG;
-            _userData.resize((size_t)len);
-            f.seekg(0, std::ios::beg);
-            if (len > 0)
-                f.read((char*)_userData.data(), len);
+
             _hasUserData = true;
+            i = consumedTo;
             continue;
         }
         if (name.IsEqualTo_Ascii_NoCase("x"))
         {
             // Ignore value, use "compress" instead
+            continue;
+        }
+        if (name.IsEqualTo_Ascii_NoCase("gen_xdb_ud"))
+        {
+            bool b = false;
+            if (!PropToBool(val, b))
+                return E_INVALIDARG;
+            _genXdbUserData = b;
             continue;
         }
         if (name.IsEqualTo_Ascii_NoCase("compress"))
@@ -1040,18 +1286,50 @@ Z7_COM7F_IMF(CHandler::UpdateItems(ISequentialOutStream *outStream, UInt32 numIt
         if (newProps || !src)
         {
             NWindows::NCOM::CPropVariant prop;
-            RINOK(cb->GetProperty(i, kpidPath, &prop));
-            if (prop.vt != VT_BSTR)
-                return E_INVALIDARG;
-            oi.Path = prop.bstrVal;
+
+            // Some 7-Zip update paths expose renamed entries via kpidName.
+            HRESULT hPath = cb->GetProperty(i, kpidPath, &prop);
+            if (hPath == S_OK && prop.vt == VT_BSTR && prop.bstrVal != nullptr)
+            {
+                oi.Path = prop.bstrVal;
+            }
+            else if (hPath == S_OK && prop.vt == VT_EMPTY && src)
+            {
+                oi.Path = src->Path;
+            }
+            else
+            {
+                prop.Clear();
+                const HRESULT hName = cb->GetProperty(i, kpidName, &prop);
+                if (hName == S_OK && prop.vt == VT_BSTR && prop.bstrVal != nullptr)
+                    oi.Path = prop.bstrVal;
+                else if (src)
+                    oi.Path = src->Path;
+                else
+                    return E_INVALIDARG;
+            }
             prop.Clear();
 
-            RINOK(cb->GetProperty(i, kpidIsDir, &prop));
-            oi.IsDir = (prop.vt == VT_BOOL && prop.boolVal != VARIANT_FALSE);
+            const HRESULT hIsDir = cb->GetProperty(i, kpidIsDir, &prop);
+            if (hIsDir == S_OK && prop.vt == VT_BOOL)
+                oi.IsDir = (prop.boolVal != VARIANT_FALSE);
+            else if (src)
+                oi.IsDir = src->IsDir;
+            else if (hIsDir == S_OK && prop.vt == VT_EMPTY)
+                oi.IsDir = false;
+            else if (hIsDir != S_OK)
+                oi.IsDir = false;
+            else
+                return E_INVALIDARG;
+
+            prop.Clear();
 
             // Check anti/delete flag if provided
-            if (cb->GetProperty(i, kpidIsAnti, &prop) == S_OK && prop.vt == VT_BOOL && prop.boolVal != VARIANT_FALSE)
+            const HRESULT hAnti = cb->GetProperty(i, kpidIsAnti, &prop);
+            if (hAnti == S_OK && prop.vt == VT_BOOL && prop.boolVal != VARIANT_FALSE)
                 continue; // delete: skip adding to outItems
+            if (hAnti == S_OK && prop.vt != VT_EMPTY && prop.vt != VT_BOOL)
+                return E_INVALIDARG;
         }
         else
         {
@@ -1227,7 +1505,7 @@ Z7_COM7F_IMF(CHandler::UpdateItems(ISequentialOutStream *outStream, UInt32 numIt
     for (unsigned i = 0; i < outItems.Size(); i++)
     {
         OutItem &oi = outItems[i];
-        if (oi.IsDir || oi.PackSize == 0)
+        if (oi.IsDir)
         {
             oi.Offset = 0;
             continue;
@@ -1335,10 +1613,24 @@ Z7_COM7F_IMF(CHandler::UpdateItems(ISequentialOutStream *outStream, UInt32 numIt
         hdrComp.swap(tmp);
     }
 
+    std::vector<Byte> generatedUserData;
+    const std::vector<Byte> *userDataToWrite = nullptr;
+    if (effVer == DBVersion::XDB)
+    {
+        if (_hasUserData && !_userData.empty())
+            userDataToWrite = &_userData;
+        else if (_genXdbUserData)
+        {
+            generatedUserData = MakeGeneratedXdbUserData();
+            if (!generatedUserData.empty())
+                userDataToWrite = &generatedUserData;
+        }
+    }
+
     // ensure total archive size fits 32-bit offsets (include header chunk header, and optional userdata)
     UInt64 totalSize = dataChunkStart + dataChunkSize + 8ULL + hdrComp.size();
-    if (_hasUserData && !_userData.empty())
-        totalSize += 8ULL + _userData.size();
+    if (userDataToWrite)
+        totalSize += 8ULL + userDataToWrite->size();
     if (totalSize > 0xFFFFFFFFull)
         return E_FAIL;
 
@@ -1373,13 +1665,27 @@ Z7_COM7F_IMF(CHandler::UpdateItems(ISequentialOutStream *outStream, UInt32 numIt
         RINOK(WriteAll(outStream, hdrComp.data(), hdrComp.size()));
 
     // append userdata chunk if present and format supports it (XDB only)
-    if (effVer == DBVersion::XDB && _hasUserData && !_userData.empty())
+    if (userDataToWrite)
     {
         const UInt32 userChunkId = kDbChunkUserData;
-        const UInt32 userSize32 = (UInt32)_userData.size();
+        const UInt32 userSize32 = (UInt32)userDataToWrite->size();
         RINOK(WriteAll(outStream, &userChunkId, sizeof(UInt32)));
         RINOK(WriteAll(outStream, &userSize32, sizeof(UInt32)));
-        RINOK(WriteAll(outStream, _userData.data(), _userData.size()));
+        RINOK(WriteAll(outStream, userDataToWrite->data(), userDataToWrite->size()));
+    }
+
+    if (effVer == DBVersion::XDB)
+    {
+        if (userDataToWrite)
+        {
+            _userData = *userDataToWrite;
+            _hasUserData = true;
+        }
+        else
+        {
+            _userData.clear();
+            _hasUserData = false;
+        }
     }
 
     _items.Clear();
@@ -1396,8 +1702,8 @@ Z7_COM7F_IMF(CHandler::UpdateItems(ISequentialOutStream *outStream, UInt32 numIt
         _items.Add(it);
     }
     _phySize = dataChunkStart + dataChunkSize + 8 + hdrComp.size();
-    if (effVer == DBVersion::XDB && _hasUserData && !_userData.empty())
-        _phySize += 8 + _userData.size();
+    if (userDataToWrite)
+        _phySize += 8 + userDataToWrite->size();
 
     return cb->SetOperationResult(NArchive::NUpdate::NOperationResult::kOK);
     COM_TRY_END
