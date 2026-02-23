@@ -18,7 +18,7 @@
 1) Download the latest release zip from GitHub
 2) Pick the DLL that matches your 7‑Zip install:  
    - `XDB_x64.dll` for 64‑bit 7‑Zip (most installs)
-   - `XDB_Win32.dll` only if you explicitly run 32‑bit 7‑Zip
+   - `XDB_x86.dll` only if you explicitly run 32‑bit 7‑Zip
 3) Copy the DLL into your 7‑Zip `Formats` directory (e.g., `C:\Program Files\7-Zip\Formats`). Create the `Formats` folder if it isn’t there.  
 
 ## 🛠 Build
@@ -36,7 +36,7 @@
 
 3. **Result**
    - `_build/x64/bin/Release/XDB_x64.dll`
-   - `_build/Win32/bin/Release/XDB_Win32.dll`
+   - `_build/Win32/bin/Release/XDB_x86.dll`
 
 ## 🧭 Usage in 7‑Zip
 

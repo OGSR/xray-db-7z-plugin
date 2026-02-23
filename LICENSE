@@ -1,5 +1,4 @@
-MIT License (plugin-specific code)
-==================================
+MIT License
 
 Copyright (c) 2026 Tosox
 
@@ -20,9 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
-Scope
------
-This license applies to the plugin-specific code in this repository, i.e.
-files outside the `third_party/` directory. Third-party components in
-`third_party/` are under their own licenses; see NOTICE for details.
