@@ -1,4 +1,5 @@
 # Xray DB 7z Plugin
+[![](https://img.shields.io/github/downloads/Tosox/xray-db-7z-plugin/total?label=Downloads&style=for-the-badge&color=green)](https://github.com/Tosox/xray-db-7z-plugin/releases)
 
 ## 📜 Description
 
