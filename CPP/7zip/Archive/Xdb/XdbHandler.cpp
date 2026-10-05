@@ -525,9 +525,25 @@ static HRESULT FindChunks(IInStream *s, UInt64 phySize,
     return (dataChunkPos && hdrChunkPos) ? S_OK : S_FALSE;
 }
 
-Z7_COM7F_IMF(CHandler::Open(IInStream *stream, const UInt64 *, IArchiveOpenCallback *))
+Z7_COM7F_IMF(CHandler::Open(IInStream* stream, const UInt64*, IArchiveOpenCallback* callback))
 {
     COM_TRY_BEGIN
+    CMyComPtr<IArchiveOpenVolumeCallback> volumeCallback;
+    callback->QueryInterface(IID_IArchiveOpenVolumeCallback, (void**)&volumeCallback);
+
+    if (volumeCallback)
+    {
+        PROPVARIANT prop;
+        PropVariantInit(&prop);
+        if (volumeCallback->GetProperty(kpidExtension, &prop) == S_OK && prop.vt == VT_BSTR)
+        {
+            UString ext = prop.bstrVal;
+            if (ext.Find(L"db") != 0 && ext.Find(L"xdb") != 0) 
+                return S_FALSE;
+        }
+        PropVariantClear(&prop);
+    }
+
     _stream = stream;
     _items.Clear();
     RINOK(GetSize(_stream, _phySize));

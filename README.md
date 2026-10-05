@@ -1,5 +1,5 @@
 # Xray DB 7z Plugin
-[![](https://img.shields.io/github/downloads/Tosox/xray-db-7z-plugin/total?label=Downloads&style=for-the-badge&color=green)](https://github.com/Tosox/xray-db-7z-plugin/releases)
+[![](https://img.shields.io/github/downloads/OGSR/xray-db-7z-plugin/total?label=Downloads&style=for-the-badge&color=green)](https://github.com/OGSR/xray-db-7z-plugin/releases)
 
 ## 📜 Description
 
@@ -16,7 +16,7 @@
 
 ## 📦 Installation
 
-1) Download the latest release zip from GitHub
+1) Download the latest release `.dll` file from GitHub
 2) Pick the DLL that matches your 7‑Zip install:  
    - `XDB_x64.dll` for 64‑bit 7‑Zip (most installs)
    - `XDB_x86.dll` only if you explicitly run 32‑bit 7‑Zip
@@ -30,7 +30,7 @@
    ```
 2. **Configure & build**
    ```pwsh
-   cmake -S . -B _build/x64 -G "Visual Studio 17 2022" -A x64
+   cmake -S . -B _build/x64 -G "Visual Studio 18 2026" -A x64
    cmake --build _build/x64 --config Release
    ```
    * Win32 build: replace `-A x64` with `-A Win32` and use `_build/Win32`.
